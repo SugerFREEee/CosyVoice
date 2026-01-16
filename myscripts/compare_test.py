@@ -6,6 +6,7 @@ python myscripts/compare_test.py
 
 import os
 import sys
+import time
 import torch
 import requests
 import numpy as np
@@ -146,21 +147,29 @@ def main():
     print("\n[Step 2] Flow 推理 (原始 DiT)...")
     token_tensor = torch.tensor([tokens], dtype=torch.int32)
     with torch.inference_mode():
+        start_time = time.time()
         tts_mel_orig = model_original.forward_flow(
             token=token_tensor,
             prompt_token=prompt_token_orig,
             prompt_feat=prompt_feat_orig,
             embedding=embedding_orig
         )
+        end_time = time.time()
+    inference_time = end_time - start_time
     print(f"  tts_mel shape: {tts_mel_orig.shape}")
     print(f"  tts_mel stats: mean={tts_mel_orig.mean():.6f}, std={tts_mel_orig.std():.6f}")
+    print(f"  推理时间: {inference_time:.4f}秒")
 
     # Step 3: HiFT 生成音频
     print("\n[Step 3] HiFT 生成音频...")
     with torch.inference_mode():
+        start_time = time.time()
         audio_orig = model_original.forward_hift(tts_mel_orig)
+        end_time = time.time()
+    inference_time = end_time - start_time
     print(f"  audio shape: {audio_orig.shape}")
     print(f"  audio stats: mean={audio_orig.mean():.6f}, std={audio_orig.std():.6f}")
+    print(f"  推理时间: {inference_time:.4f}秒")
 
     # ============================================================
     # 方法2：使用 vLLM-Omni (cosy_server + vllm_server)
@@ -240,16 +249,7 @@ def main():
         "batch_size": 1,
         "num_inference_steps": 10
     }
-    
-    # 保存dit_input到文件，用于后续不同dtype的测试
-    import json
-    import os
-    save_dir = "/home/wjs/workspace/data/dit_input_test"
-    os.makedirs(save_dir, exist_ok=True)
-    save_path = os.path.join(save_dir, "dit_input.json")
-    with open(save_path, "w") as f:
-        json.dump(dit_input, f)
-    print(f"  📁 dit_input已保存到: {save_path}")
+
 
     # 先进行echo测试，验证数据传输是否正确
     print("\n[测试] vLLM-Omni 数据传输测试 (echo)...")
@@ -296,9 +296,12 @@ def main():
 
     # 执行实际的推理请求
     print("\n[推理] 执行 vLLM-Omni DiT 推理...")
+    start_time = time.time()
     response = requests.post(f"http://{vllm_host}:{vllm_port}/infer", json=dit_input, timeout=120)
     response.raise_for_status()
     vllm_output = response.json()
+    end_time = time.time()
+    inference_time = end_time - start_time
 
     # 处理 vLLM 返回的 tts_mel 中可能包含的 None 值
     mel_data = vllm_output["tts_mel"]
@@ -308,14 +311,19 @@ def main():
     tts_mel_new = torch.tensor(mel_clean, dtype=dtype, device=model_original.device)
     print(f"  tts_mel shape: {tts_mel_new.shape}")
     print(f"  tts_mel stats: mean={tts_mel_new.mean():.6f}, std={tts_mel_new.std():.6f}")
+    print(f"  推理时间: {inference_time:.4f}秒")
 
     # Step 3: HiFT 生成音频
     print("\n[Step 3] HiFT 生成音频...")
     with torch.inference_mode():
+        start_time = time.time()
         # HiFT 模型期望输入为 float32 类型，与模型参数保持一致
         tts_mel_new_device = tts_mel_new.to(model_original.device, dtype=torch.float32)
         audio_new = model_original.forward_hift(tts_mel_new_device)
+        end_time = time.time()
+    inference_time = end_time - start_time
     print(f"  audio shape: {audio_new.shape}")
+    print(f"  推理时间: {inference_time:.4f}秒")
     print(f"  audio stats: mean={audio_new.mean():.6f}, std={audio_new.std():.6f}")
 
     # ============================================================

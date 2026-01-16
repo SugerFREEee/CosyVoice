@@ -4,13 +4,12 @@ python cosy_server.py --model-dir /home/wjs/workspace/model/FunAudioLLM/Fun-Cosy
 使用批量推理模式
 /home/wjs/workspace/miniconda3/envs/cosyvoice/bin/python myscripts/cosy_server.py       \
     --model-dir /home/wjs/workspace/model/FunAudioLLM/Fun-CosyVoice3-0.5B-2512       \
-    --batch-infer       \
+    --batch-infer \
     --input-lst /home/wjs/workspace/data/CowboyZ/seed-tts-eval/seedtts_testset/zh/meta.lst       \
     --tokens-dir /home/wjs/workspace/data/seedtts_tokens       \
-    --output-dir /home/wjs/workspace/data/new_seedtts_output_with_tokens       \
+    --output-dir /cfs-czb184s7/jasonjswang/fn1bn0warmup0diff0.4       \
     --vllm-host localhost       \
-    --vllm-port 8001 \
-    --total-size 1
+    --vllm-port 8001 
 
 """
 
@@ -426,7 +425,11 @@ def _run_batch_inference(
         error_count = 0
         
         # 使用 tqdm 显示进度条
-        for batch in tqdm(data_loader, desc=f"Epoch {epoch + 1}", unit="batch"):
+        for batch_idx, batch in enumerate(tqdm(data_loader, desc=f"Epoch {epoch + 1}", unit="batch")):
+            batch_start_time = time.time()
+            batch_success = 0
+            batch_error = 0
+            
             try:
                 ids, tokens_list, prompt_wavs_list = batch
                 
@@ -467,22 +470,38 @@ def _run_batch_inference(
                         print(f"[DEBUG]   Saved to: {output_path}")
 
                         success_count += 1
+                        batch_success += 1
                     except Exception as e:
                         error_count += 1
+                        batch_error += 1
                         print(f"\n[ERROR] Failed to process {utt_id}: {str(e)}")
                         import traceback
                         traceback.print_exc()
                         continue
+            except Exception as e:
+                error_count += 1
+                batch_error += 1
+                print(f"\nError processing batch: {str(e)}")
+                continue
+            
+            # 计算并输出 batch 吞吐量
+            batch_end_time = time.time()
+            batch_time = batch_end_time - batch_start_time
+            batch_size_actual = batch_success + batch_error
+            if batch_time > 0 and batch_success > 0:
+                batch_throughput = batch_success / batch_time
+                print(f"\nBatch {batch_idx + 1} completed!")
+                print(f"  Batch size:        {batch_size_actual}")
+                print(f"  Successful:        {batch_success}/{batch_size_actual}")
+                print(f"  Batch time:        {batch_time:.3f}s")
+                print(f"  Batch throughput:  {batch_throughput:.2f} samples/s")
                 
                 # 检查是否达到了指定的总处理数量
                 if total_size is not None and (success_count + error_count) >= total_size:
                     print(f"\nReached total size limit: {total_size}. Stopping inference.")
                     # 跳出外层循环
                     break
-            except Exception as e:
-                error_count += 1
-                print(f"\nError processing batch: {str(e)}")
-                continue
+
         
         end_time = time.time()
         end_datetime = datetime.now()
