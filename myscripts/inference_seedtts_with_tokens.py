@@ -121,7 +121,7 @@ def inference_with_preloaded_tokens(model, token_tensor, prompt_wav, prompt_text
             speed=speed
         )
 
-        torchaudio.save(output_file, tts_speech.cpu(), sample_rate)
+        # torchaudio.save(output_file, tts_speech.cpu(), sample_rate)
 
     # 清理缓存
     if uuid_str in model.model.hift_cache_dict:

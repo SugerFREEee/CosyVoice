@@ -7,10 +7,14 @@ python cosy_server.py --model-dir /home/wjs/workspace/model/FunAudioLLM/Fun-Cosy
     --batch-infer \
     --input-lst /home/wjs/workspace/data/CowboyZ/seed-tts-eval/seedtts_testset/zh/meta.lst       \
     --tokens-dir /home/wjs/workspace/data/seedtts_tokens       \
-    --output-dir /cfs-czb184s7/jasonjswang/fn1bn0warmup0diff0.4       \
-    --vllm-host localhost       \
-    --vllm-port 8001 
+    --output-dir /cfs-czb184s7/jasonjswang/fn1bn0warmup0diff0.4       
 
+
+/home/wjs/workspace/miniconda3/envs/cosyvoice/bin/python myscripts/cosy_server.py \
+    --model-dir /home/wjs/workspace/model/FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
+    --batch-infer \
+    --input-lst /home/wjs/workspace/data/CowboyZ/seed-tts-eval/seedtts_testset/zh/meta.lst \
+    --tokens-dir /home/wjs/workspace/data/seedtts_tokens
 """
 
 
@@ -19,6 +23,8 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import json
+import msgpack
 from contextlib import nullcontext
 from typing import Any, Dict, List, Optional
 from torch.utils.data import DataLoader, Dataset
@@ -27,9 +33,19 @@ import time
 from tqdm import tqdm
 from datetime import datetime, timedelta
 
+# 添加ZeroMQ支持
+try:
+    import zmq
+except ImportError:
+    print("[ERROR] ZeroMQ not installed. Please run 'pip install pyzmq' to enable ZeroMQ support.")
+    sys.exit(1)
+
+# 确保zmq可用
+if zmq is None:
+    print("[ERROR] ZeroMQ not available.")
+    sys.exit(1)
+
 import torch
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 
 current_file = os.path.abspath(__file__)
 current_dir = os.path.dirname(current_file)
@@ -40,18 +56,6 @@ sys.path.append(os.path.join(project_root, "third_party", "Matcha-TTS"))
 sys.path.append(current_dir)
 
 from token2wav_dit import CosyVoice2_Token2Wav, load_tokens_from_file
-
-
-class Token2DitInputRequest(BaseModel):
-    prompt_wav_path: str
-    tokens: Optional[List[int]] = None
-    token_file: Optional[str] = None
-
-
-class DitOutputRequest(BaseModel):
-    tts_mel: List[List[List[float]]]
-    mel_dtype: Optional[str] = None
-
 
 class CosyVoiceRuntime:
     def __init__(self, model_dir: str, device_id: int, dtype: torch.dtype):
@@ -164,7 +168,6 @@ class CosyVoiceRuntime:
         return {"audio": audio, "sample_rate": self.sample_rate}
 
 
-app = FastAPI(title="CosyVoice Token2Wav Helper", version="0.1.0")
 runtime: Optional[CosyVoiceRuntime] = None
 
 
@@ -291,45 +294,8 @@ def collate_fn(batch):
 
 def _require_runtime() -> CosyVoiceRuntime:
     if runtime is None:
-        raise HTTPException(status_code=503, detail="Runtime is not initialized")
+        raise RuntimeError("Runtime is not initialized")
     return runtime
-
-
-@app.get("/health")
-def health() -> Dict[str, str]:
-    status = "ready" if runtime else "initializing"
-    return {"status": status}
-
-
-@app.post("/token2dit-input")
-def token2dit_input(req: Token2DitInputRequest) -> Dict[str, Any]:
-    rt = _require_runtime()
-
-    tokens: Optional[List[int]] = req.tokens
-    if tokens is None:
-        if not req.token_file:
-            raise HTTPException(status_code=400, detail="Either tokens or token_file must be provided")
-        token_path = os.path.abspath(req.token_file)
-        if not os.path.isfile(token_path):
-            raise HTTPException(status_code=404, detail=f"Token file not found: {token_path}")
-        tokens = load_tokens_from_file(token_path)
-
-    prompt_wav = os.path.abspath(req.prompt_wav_path)
-    try:
-        return rt.prepare_dit_inputs(tokens, prompt_wav)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-
-@app.post("/dit-output2wav")
-def dit_output2wav(req: DitOutputRequest) -> Dict[str, Any]:
-    rt = _require_runtime()
-    try:
-        return rt.dit_output_to_wav(req.tts_mel, req.mel_dtype)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 def _setup_runtime(model_dir: str, device_id: int, dtype_name: str):
@@ -360,8 +326,7 @@ def _run_batch_inference(
     warmup: int,
     total_size: Optional[int] = None,
     sample_rate: int = 16000,
-    vllm_host: str = "localhost",
-    vllm_port: int = 8001
+    zmq_address: str = "ipc:///tmp/vllm.sock"
 ):
     """执行批量推理
     
@@ -376,10 +341,18 @@ def _run_batch_inference(
         warmup: 预热轮数
         total_size: 要处理的样本总数（默认处理所有样本）
         sample_rate: 输入提示音频的采样率
-        vllm_host: vllm服务器主机
-        vllm_port: vllm服务器端口
+        zmq_address: ZeroMQ服务端地址
     """
-    import requests
+    # 初始化ZeroMQ客户端
+    zmq_socket = None
+    try:
+        context = zmq.Context()
+        zmq_socket = context.socket(zmq.DEALER)  # DEALER模式支持多客户端
+        zmq_socket.connect(zmq_address)
+        print(f"[cosy_server] ZeroMQ client connected to {zmq_address}")
+    except Exception as e:
+        print(f"[ERROR] Failed to connect to ZeroMQ server: {e}")
+        return
     
     # 设置运行时
     _setup_runtime(model_dir, device_id, dtype_name)
@@ -424,6 +397,10 @@ def _run_batch_inference(
         success_count = 0
         error_count = 0
         
+        # 用于统计通信开销
+        total_comm_time = 0.0
+        comm_count = 0
+        
         # 使用 tqdm 显示进度条
         for batch_idx, batch in enumerate(tqdm(data_loader, desc=f"Epoch {epoch + 1}", unit="batch")):
             batch_start_time = time.time()
@@ -443,31 +420,38 @@ def _run_batch_inference(
                     try:
                         # Step 1: 获取 DiT 输入特征
                         # 直接调用 runtime 方法，不通过 HTTP API
-                        print(f"[DEBUG] Processing {utt_id}...")
+                        # print(f"[DEBUG] Processing {utt_id}...")
                         dit_input = runtime.prepare_dit_inputs(tokens, prompt_wav)
-                        print(f"[DEBUG]   DiT input prepared, seq_len={dit_input['seq_len']}")
+                        # print(f"[DEBUG]   DiT input prepared, seq_len={dit_input['seq_len']}")
 
                         # Step 2: 调用 vllm_server 生成 mel
-                        vllm_response = requests.post(
-                            f"http://{vllm_host}:{vllm_port}/infer",
-                            json=dit_input,
-                            timeout=120
-                        )
-                        print(f"[DEBUG]   vLLM response status: {vllm_response.status_code}")
-                        vllm_response.raise_for_status()
-                        vllm_output = vllm_response.json()
-                        print(f"[DEBUG]   Received mel, shape: {len(vllm_output['tts_mel'])}x{len(vllm_output['tts_mel'][0])}x{len(vllm_output['tts_mel'][0][0])}")
+                        vllm_output = None
+                        
+                      
+                        serialized_data = msgpack.packb(dit_input, use_bin_type=True)
+                       
+                        zmq_socket.send(serialized_data)
+
+                        response = zmq_socket.recv()
+                        
+                        import numpy as np
+                        vllm_output = msgpack.unpackb(response, raw=False)
+                        mel = np.frombuffer(vllm_output["data"], dtype=vllm_output["dtype"]).reshape(vllm_output["shape"])
+                        
+                        # 检查是否有错误
+                        if "error" in vllm_output:
+                            raise Exception(f"vLLM error: {vllm_output['error']}")
+                        
 
                         # Step 3: 将 mel 转换为音频
                         # 直接调用 runtime 方法，不通过 HTTP API
-                        wav_output = runtime.dit_output_to_wav(vllm_output["tts_mel"], vllm_output["mel_dtype"])
-                        print(f"[DEBUG]   Audio generated, length: {len(wav_output['audio'])} samples")
+                        wav_output = runtime.dit_output_to_wav(mel, str(mel.dtype))
 
                         # 保存音频文件
-                        audio_tensor = torch.tensor(wav_output["audio"])
-                        output_path = os.path.join(output_dir, f"{utt_id}.wav")
-                        torchaudio.save(output_path, audio_tensor.unsqueeze(0), wav_output["sample_rate"])
-                        print(f"[DEBUG]   Saved to: {output_path}")
+                        # audio_tensor = torch.tensor(wav_output["audio"])
+                        # output_path = os.path.join(output_dir, f"{utt_id}.wav")
+                        # torchaudio.save(output_path, audio_tensor.unsqueeze(0), wav_output["sample_rate"])
+                        # print(f"[DEBUG]   Saved to: {output_path}")
 
                         success_count += 1
                         batch_success += 1
@@ -513,6 +497,14 @@ def _run_batch_inference(
         if success_count > 0:
             print(f"  Avg time/sample:   {epoch_time/success_count:.3f}s")
             print(f"  Throughput:        {success_count/epoch_time:.2f} samples/s")
+        # 输出通信开销统计
+        # if comm_count > 0:
+        #     avg_comm_time = total_comm_time / comm_count
+        #     print(f"  Avg communication time: {avg_comm_time:.3f}s")
+    
+    # 关闭ZeroMQ连接
+    if zmq_socket:
+        zmq_socket.close()
     
     print("\n" + "="*80)
     print("BATCH INFERENCE COMPLETED!")
@@ -523,15 +515,13 @@ def _run_batch_inference(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="CosyVoice helper server")
+    parser = argparse.ArgumentParser(description="CosyVoice batch inference client")
     parser.add_argument("--model-dir", type=str, required=True, help="Path to CosyVoice checkpoint directory")
     parser.add_argument("--device-id", type=int, default=0, help="CUDA device id")
     parser.add_argument("--dtype", type=str, default="float16", help="Computation dtype (float16, bfloat16, float32)")
-    parser.add_argument("--host", type=str, default="0.0.0.0", help="Server host")
-    parser.add_argument("--port", type=int, default=8000, help="Server port")
     
     # 批量推理参数
-    parser.add_argument("--batch-infer", action="store_true", help="Run batch inference instead of starting server")
+    parser.add_argument("--batch-infer", action="store_true", help="Run batch inference")
     parser.add_argument("--input-lst", type=str, help="Input meta list file path")
     parser.add_argument("--tokens-dir", type=str, help="Directory containing pre-saved token files")
     parser.add_argument("--output-dir", type=str, default="./output", help="Output directory")
@@ -539,8 +529,8 @@ def main():
     parser.add_argument("--total-size", type=int, help="Total number of samples to process (default: process all)")
     parser.add_argument("--warmup", type=int, default=1, help="Number of warmup epochs")
     parser.add_argument("--sample-rate", type=int, default=16000, help="Sample rate for input prompt audio (default: 16000)")
-    parser.add_argument("--vllm-host", type=str, default="localhost", help="vLLM server host")
-    parser.add_argument("--vllm-port", type=int, default=8001, help="vLLM server port")
+    # ZeroMQ参数
+    parser.add_argument("--zmq-address", type=str, default="ipc:///tmp/vllm.sock", help="ZeroMQ服务端地址")
     
     args = parser.parse_args()
     
@@ -561,15 +551,13 @@ def main():
             warmup=args.warmup,
             total_size=args.total_size,
             sample_rate=args.sample_rate,
-            vllm_host=args.vllm_host,
-            vllm_port=args.vllm_port
+            zmq_address=args.zmq_address
         )
     else:
-        # 启动服务器
-        _setup_runtime(args.model_dir, args.device_id, args.dtype)
-        
-        import uvicorn
-        uvicorn.run(app, host=args.host, port=args.port)
+        # 显示帮助信息
+        parser.print_help()
+        print("\nNote: This script now only supports batch inference mode with ZeroMQ communication.")
+        print("Use --batch-infer to run batch inference.")
 
 
 _bootstrap_from_env()

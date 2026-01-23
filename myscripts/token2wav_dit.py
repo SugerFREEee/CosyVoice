@@ -2,7 +2,7 @@
 # This script implements a non-streaming token-to-waveform conversion using CosyVoice2 models.
 # It converts generated speech tokens to audio waveforms using the cosyvoice library.
 """ Example Usage
-    CUDA_VISIBLE_DEVICES=0 python3 myscripts/token2wav_dit.py
+    /home/wjs/workspace/miniconda3/envs/cosyvoice/bin/python myscripts/token2wav_dit.py
 """
 import torch
 import sys
@@ -247,7 +247,7 @@ def get_args():
     parser.add_argument("--output-dir", type=str, default="/home/wjs/workspace/data/new_seedtts_output_tokens")
     parser.add_argument("--input-lst", type=str, default="/home/wjs/workspace/data/CowboyZ/seed-tts-eval/seedtts_testset/zh/meta.lst", help="Input meta list file path (format: utt|prompt_text|prompt_wav|infer_text)")
     parser.add_argument("--tokens-dir", type=str, default="/home/wjs/workspace/data/seedtts_tokens", help="Directory containing pre-saved token files")
-    parser.add_argument("--warmup", type=int, default=3, help="Number of warmup epochs, performance statistics will only be collected from the last epoch")
+    parser.add_argument("--warmup", type=int, default=1, help="Number of warmup epochs, performance statistics will only be collected from the last epoch")
     parser.add_argument("--sample-rate", type=int, default=22050, help="Sample rate for input prompt audio (default: 22050)")
     return parser.parse_args()
 
@@ -303,9 +303,9 @@ if __name__ == "__main__":
 
                 generated_wavs = model(generated_speech_tokens_list, prompt_audios_list, prompt_audios_sample_rate)
 
-                for id, wav in zip(ids, generated_wavs):
-                    torchaudio.save(f"{args.output_dir}/{id}.wav", wav.cpu(), 24000)
-                    success_count += 1
+                # for id, wav in zip(ids, generated_wavs):
+                #     torchaudio.save(f"{args.output_dir}/{id}.wav", wav.cpu(), 24000)
+                #     success_count += 1
             except Exception as e:
                 error_count += 1
                 print(f"\nError processing batch: {str(e)}")
