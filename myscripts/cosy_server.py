@@ -14,7 +14,9 @@ python cosy_server.py --model-dir /home/wjs/workspace/model/FunAudioLLM/Fun-Cosy
     --model-dir /home/wjs/workspace/model/FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
     --batch-infer \
     --input-lst /home/wjs/workspace/data/CowboyZ/seed-tts-eval/seedtts_testset/zh/meta.lst \
-    --tokens-dir /home/wjs/workspace/data/seedtts_tokens
+    --tokens-dir /home/wjs/workspace/data/seedtts_tokens \
+    --num-workers 10
+
 """
 
 
@@ -25,13 +27,13 @@ import os
 import sys
 import json
 import msgpack
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from typing import Any, Dict, List, Optional
-from torch.utils.data import DataLoader, Dataset
-import torchaudio
+from torch.utils.data import Dataset
 import time
 from tqdm import tqdm
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 # 添加ZeroMQ支持
 try:
@@ -45,6 +47,7 @@ if zmq is None:
     print("[ERROR] ZeroMQ not available.")
     sys.exit(1)
 
+import numpy as np
 import torch
 
 current_file = os.path.abspath(__file__)
@@ -282,16 +285,6 @@ class LocalToken2WavDataset(Dataset):
         }
 
 
-def collate_fn(batch):
-    ids, tokens_list, prompt_wavs_list = [], [], []
-    for item in batch:
-        tokens_list.append(item['target_audio_cosy2_tokens'])
-        prompt_wavs_list.append(item['prompt_wav'])
-        ids.append(item['id'])
-
-    return ids, tokens_list, prompt_wavs_list
-
-
 def _require_runtime() -> CosyVoiceRuntime:
     if runtime is None:
         raise RuntimeError("Runtime is not initialized")
@@ -322,11 +315,11 @@ def _run_batch_inference(
     input_lst: str,
     tokens_dir: str,
     output_dir: str,
-    batch_size: int,
     warmup: int,
     total_size: Optional[int] = None,
     sample_rate: int = 16000,
-    zmq_address: str = "ipc:///tmp/vllm.sock"
+    zmq_address: str = "ipc:///tmp/vllm.sock",
+    num_workers: int = 1,
 ):
     """执行批量推理
     
@@ -337,23 +330,12 @@ def _run_batch_inference(
         input_lst: 输入列表文件路径
         tokens_dir: token文件目录
         output_dir: 输出目录
-        batch_size: 批次大小
         warmup: 预热轮数
         total_size: 要处理的样本总数（默认处理所有样本）
         sample_rate: 输入提示音频的采样率
         zmq_address: ZeroMQ服务端地址
+        num_workers: 并发线程数（每线程维护自己的ZeroMQ socket）
     """
-    # 初始化ZeroMQ客户端
-    zmq_socket = None
-    try:
-        context = zmq.Context()
-        zmq_socket = context.socket(zmq.DEALER)  # DEALER模式支持多客户端
-        zmq_socket.connect(zmq_address)
-        print(f"[cosy_server] ZeroMQ client connected to {zmq_address}")
-    except Exception as e:
-        print(f"[ERROR] Failed to connect to ZeroMQ server: {e}")
-        return
-    
     # 设置运行时
     _setup_runtime(model_dir, device_id, dtype_name)
     
@@ -378,133 +360,70 @@ def _run_batch_inference(
         else:
             print(f"Total size {total_size} is larger than dataset size {len(dataset)}, processing all samples")
     
-    data_loader = DataLoader(
-        dataset, 
-        batch_size=batch_size, 
-        shuffle=False, 
-        collate_fn=collate_fn,
-        num_workers=0
-    )
-    
-    print(f"\nStarting batch inference with {warmup} warmup epoch(s)...")
+    items = dataset.data_items
+    print(f"\nStarting batch inference with {warmup} warmup epoch(s)... (workers={num_workers})")
     print("="*80)
-    
+
+    def _process_single(item):
+        utt_id = item["utt"]
+        sock = None
+        try:
+            tokens = load_tokens_from_file(item["token_file"])
+            dit_input = runtime.prepare_dit_inputs(tokens, item["prompt_wav"])
+
+            ctx = zmq.Context.instance()
+            sock = ctx.socket(zmq.DEALER)
+            sock.setsockopt(zmq.LINGER, 0)
+            sock.connect(zmq_address)
+
+            serialized_data = msgpack.packb(dit_input, use_bin_type=True)
+            sock.send(serialized_data)
+
+            response = sock.recv()
+            vllm_output = msgpack.unpackb(response, raw=False)
+
+            if "error" in vllm_output:
+                raise RuntimeError(f"vLLM error: {vllm_output['error']}")
+
+            mel = np.frombuffer(vllm_output["data"], dtype=vllm_output["dtype"]).reshape(vllm_output["shape"])
+            runtime.dit_output_to_wav(mel, str(mel.dtype))
+            return True
+        except Exception as e:
+            print(f"\n[ERROR] Failed to process {utt_id}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return False
+        finally:
+            if sock is not None:
+                sock.close()
+
     for epoch in range(warmup):
         print(f"\nEpoch {epoch + 1}/{warmup}")
         start_time = time.time()
-        start_datetime = datetime.now()
-        
+
         success_count = 0
         error_count = 0
-        
-        # 用于统计通信开销
-        total_comm_time = 0.0
-        comm_count = 0
-        
-        # 使用 tqdm 显示进度条
-        for batch_idx, batch in enumerate(tqdm(data_loader, desc=f"Epoch {epoch + 1}", unit="batch")):
-            batch_start_time = time.time()
-            batch_success = 0
-            batch_error = 0
-            
-            try:
-                ids, tokens_list, prompt_wavs_list = batch
-                
-                for utt_id, tokens, prompt_wav in zip(ids, tokens_list, prompt_wavs_list):
-                    # 检查是否达到了指定的总处理数量
-                    if total_size is not None and (success_count + error_count) >= total_size:
-                        print(f"\nReached total size limit: {total_size}. Stopping inference.")
-                        # 跳出内层循环
-                        break
-                    
-                    try:
-                        # Step 1: 获取 DiT 输入特征
-                        # 直接调用 runtime 方法，不通过 HTTP API
-                        # print(f"[DEBUG] Processing {utt_id}...")
-                        dit_input = runtime.prepare_dit_inputs(tokens, prompt_wav)
-                        # print(f"[DEBUG]   DiT input prepared, seq_len={dit_input['seq_len']}")
 
-                        # Step 2: 调用 vllm_server 生成 mel
-                        vllm_output = None
-                        
-                      
-                        serialized_data = msgpack.packb(dit_input, use_bin_type=True)
-                       
-                        zmq_socket.send(serialized_data)
-
-                        response = zmq_socket.recv()
-                        
-                        import numpy as np
-                        vllm_output = msgpack.unpackb(response, raw=False)
-                        mel = np.frombuffer(vllm_output["data"], dtype=vllm_output["dtype"]).reshape(vllm_output["shape"])
-                        
-                        # 检查是否有错误
-                        if "error" in vllm_output:
-                            raise Exception(f"vLLM error: {vllm_output['error']}")
-                        
-
-                        # Step 3: 将 mel 转换为音频
-                        # 直接调用 runtime 方法，不通过 HTTP API
-                        wav_output = runtime.dit_output_to_wav(mel, str(mel.dtype))
-
-                        # 保存音频文件
-                        # audio_tensor = torch.tensor(wav_output["audio"])
-                        # output_path = os.path.join(output_dir, f"{utt_id}.wav")
-                        # torchaudio.save(output_path, audio_tensor.unsqueeze(0), wav_output["sample_rate"])
-                        # print(f"[DEBUG]   Saved to: {output_path}")
-
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = [executor.submit(_process_single, item) for item in items]
+            with tqdm(total=len(futures), desc=f"Epoch {epoch + 1}", unit="sample") as pbar:
+                for fut in as_completed(futures):
+                    ok = fut.result()
+                    if ok:
                         success_count += 1
-                        batch_success += 1
-                    except Exception as e:
+                    else:
                         error_count += 1
-                        batch_error += 1
-                        print(f"\n[ERROR] Failed to process {utt_id}: {str(e)}")
-                        import traceback
-                        traceback.print_exc()
-                        continue
-            except Exception as e:
-                error_count += 1
-                batch_error += 1
-                print(f"\nError processing batch: {str(e)}")
-                continue
-            
-            # 计算并输出 batch 吞吐量
-            batch_end_time = time.time()
-            batch_time = batch_end_time - batch_start_time
-            batch_size_actual = batch_success + batch_error
-            if batch_time > 0 and batch_success > 0:
-                batch_throughput = batch_success / batch_time
-                print(f"\nBatch {batch_idx + 1} completed!")
-                print(f"  Batch size:        {batch_size_actual}")
-                print(f"  Successful:        {batch_success}/{batch_size_actual}")
-                print(f"  Batch time:        {batch_time:.3f}s")
-                print(f"  Batch throughput:  {batch_throughput:.2f} samples/s")
-                
-                # 检查是否达到了指定的总处理数量
-                if total_size is not None and (success_count + error_count) >= total_size:
-                    print(f"\nReached total size limit: {total_size}. Stopping inference.")
-                    # 跳出外层循环
-                    break
+                    pbar.update(1)
 
-        
         end_time = time.time()
-        end_datetime = datetime.now()
         epoch_time = end_time - start_time
-        
+
         print(f"\nEpoch {epoch + 1} completed!")
         print(f"  Duration:          {timedelta(seconds=int(epoch_time))}")
         print(f"  Successful:        {success_count}/{success_count + error_count}")
         if success_count > 0:
             print(f"  Avg time/sample:   {epoch_time/success_count:.3f}s")
             print(f"  Throughput:        {success_count/epoch_time:.2f} samples/s")
-        # 输出通信开销统计
-        # if comm_count > 0:
-        #     avg_comm_time = total_comm_time / comm_count
-        #     print(f"  Avg communication time: {avg_comm_time:.3f}s")
-    
-    # 关闭ZeroMQ连接
-    if zmq_socket:
-        zmq_socket.close()
     
     print("\n" + "="*80)
     print("BATCH INFERENCE COMPLETED!")
@@ -525,10 +444,10 @@ def main():
     parser.add_argument("--input-lst", type=str, help="Input meta list file path")
     parser.add_argument("--tokens-dir", type=str, help="Directory containing pre-saved token files")
     parser.add_argument("--output-dir", type=str, default="./output", help="Output directory")
-    parser.add_argument("--batch-size", type=int, default=1, help="Batch size for inference")
     parser.add_argument("--total-size", type=int, help="Total number of samples to process (default: process all)")
     parser.add_argument("--warmup", type=int, default=1, help="Number of warmup epochs")
     parser.add_argument("--sample-rate", type=int, default=16000, help="Sample rate for input prompt audio (default: 16000)")
+    parser.add_argument("--num-workers", type=int, default=1, help="并发线程数（客户端侧）")
     # ZeroMQ参数
     parser.add_argument("--zmq-address", type=str, default="ipc:///tmp/vllm.sock", help="ZeroMQ服务端地址")
     
@@ -547,11 +466,11 @@ def main():
             input_lst=args.input_lst,
             tokens_dir=args.tokens_dir,
             output_dir=args.output_dir,
-            batch_size=args.batch_size,
             warmup=args.warmup,
             total_size=args.total_size,
             sample_rate=args.sample_rate,
-            zmq_address=args.zmq_address
+            zmq_address=args.zmq_address,
+            num_workers=args.num_workers,
         )
     else:
         # 显示帮助信息
