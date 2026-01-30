@@ -2,7 +2,16 @@
 # This script implements a non-streaming token-to-waveform conversion using CosyVoice2 models.
 # It converts generated speech tokens to audio waveforms using the cosyvoice library.
 """ Example Usage
-    /home/wjs/workspace/miniconda3/envs/cosyvoice/bin/python myscripts/token2wav_dit.py
+nsys profile \
+--gpu-metrics-device=all \
+--trace=cuda,nvtx,osrt \
+--cuda-memory-usage=true \
+--cpuctxsw=process-tree \
+--export=sqlite \
+--force-overwrite=true \
+-o ./nsys/nsys_token2wav_dit \
+    /home/wjs/workspace/miniconda3/envs/cosyvoice/bin/python myscripts/token2wav_dit.py \
+        --total-sample 10   
 """
 import torch
 import sys
@@ -15,8 +24,11 @@ sys.path.append(project_root)
 # 添加Matcha-TTS到Python搜索路径
 sys.path.append('/home/wjs/workspace/CosyVoice/third_party/Matcha-TTS')
 
+# Use PyTorch's built-in NVTX support
+nvtx = torch.cuda.nvtx
 
-from torch.utils.data import DataLoader, Dataset
+
+from torch.utils.data import DataLoader, Dataset, Subset
 import torchaudio
 import argparse
 import time
@@ -106,14 +118,21 @@ class CosyVoice2_Token2Wav(torch.nn.Module):
             token = torch.tensor([generated_speech_tokens], dtype=torch.int32)
 
             # 步骤1: 提取 prompt 音频特征
+            nvtx.range_push("prompt_features")
             prompt_token, prompt_feat, embedding = self.extract_prompt_features(prompt_wav_path)
+            nvtx.range_pop()
 
             # 步骤2: Flow 模型推理生成 mel 频谱
+            nvtx.range_push("flow.inference")
             tts_mel = self.forward_flow(token, prompt_token, prompt_feat, embedding)
+            nvtx.range_pop()
 
             # 步骤3: HiFT 声码器推理生成音频波形
+            nvtx.range_push("hift.inference")
             tts_speech = self.forward_hift(tts_mel)
-
+            nvtx.range_pop()
+            
+            # 将生成的音频添加到结果列表
             generated_wavs.append(tts_speech)
 
         return generated_wavs
@@ -249,6 +268,7 @@ def get_args():
     parser.add_argument("--tokens-dir", type=str, default="/home/wjs/workspace/data/seedtts_tokens", help="Directory containing pre-saved token files")
     parser.add_argument("--warmup", type=int, default=1, help="Number of warmup epochs, performance statistics will only be collected from the last epoch")
     parser.add_argument("--sample-rate", type=int, default=22050, help="Sample rate for input prompt audio (default: 22050)")
+    parser.add_argument("--total-sample", type=int, default=None, help="Total number of samples to process from the dataset")
     return parser.parse_args()
 
 
@@ -281,7 +301,14 @@ if __name__ == "__main__":
         tokens_dir=args.tokens_dir,
         sample_rate=args.sample_rate
     )
-    print(f"Dataset loaded: {len(dataset)} samples")
+    
+    # Apply total_sample if specified
+    if args.total_sample is not None:
+        total_sample = min(args.total_sample, len(dataset))
+        dataset = Subset(dataset, range(total_sample))
+        print(f"Using subset of dataset: {total_sample} samples")
+    else:
+        print(f"Dataset loaded: {len(dataset)} samples")
 
     data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=0)
 
