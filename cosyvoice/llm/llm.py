@@ -141,6 +141,7 @@ class TransformerLM(torch.nn.Module):
 
         # 6. run lm forward
         lm_output, lm_output_mask = self.llm(lm_input, lm_input_len.to(device))
+        lm_output = lm_output.to(self.llm_decoder.weight.dtype)
         logits = self.llm_decoder(lm_output)
         loss = self.criterion_ce(logits, lm_target)
         acc = th_accuracy(logits.view(-1, self.speech_token_size + 1), lm_target, ignore_label=IGNORE_ID)
@@ -216,6 +217,7 @@ class TransformerLM(torch.nn.Module):
                                                                   att_cache=att_cache, cnn_cache=cnn_cache,
                                                                   att_mask=torch.tril(torch.ones((1, lm_input.shape[1], lm_input.shape[1]),
                                                                                                  device=lm_input.device)).to(torch.bool))
+            y_pred = y_pred.to(self.llm_decoder.weight.dtype)
             logp = self.llm_decoder(y_pred[:, -1]).log_softmax(dim=-1)
             top_ids = self.sampling_ids(logp.squeeze(dim=0), out_tokens, sampling, ignore_eos=True if i < min_len else False)
             if top_ids == self.eos_token:
@@ -235,6 +237,7 @@ class Qwen2Encoder(torch.nn.Module):
     def forward(self, xs: torch.Tensor, xs_lens: torch.Tensor):
         T = xs.size(1)
         masks = ~make_pad_mask(xs_lens, T)
+        xs = xs.to(dtype=self.model.dtype)
         outs = self.model(
             inputs_embeds=xs,
             attention_mask=masks,
@@ -245,6 +248,7 @@ class Qwen2Encoder(torch.nn.Module):
 
     def forward_one_step(self, xs, masks, cache=None):
         input_masks = masks[:, -1, :]
+        xs = xs.to(dtype=self.model.dtype)
         outs = self.model(
             inputs_embeds=xs,
             attention_mask=input_masks,
@@ -515,6 +519,7 @@ class Qwen2LM(TransformerLM):
                 y_pred, cache = self.llm.forward_one_step(lm_input,
                                                           masks=torch.tril(torch.ones((1, lm_input.shape[1], lm_input.shape[1]), device=lm_input.device)).to(torch.bool),
                                                           cache=cache)
+                y_pred = y_pred.to(self.llm_decoder.weight.dtype)
                 logp = self.llm_decoder(y_pred[:, -1]).log_softmax(dim=-1)
                 top_ids = self.sampling_ids(logp.squeeze(dim=0), out_tokens, sampling, ignore_eos=True if i < min_len else False)
                 if top_ids in self.stop_token_ids:
