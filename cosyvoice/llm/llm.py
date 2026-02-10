@@ -18,10 +18,29 @@ import time
 import threading
 from typing import Dict, Optional, Callable, List, Generator
 import numpy as np
+import os
+import importlib.util as _importlib_util
 import torch
 from torch import nn
 import torch.nn.functional as F
-from transformers import Qwen2ForCausalLM
+# Avoid optional deepspeed/triton imports that trigger local compilation.
+os.environ.setdefault("DS_BUILD_OPS", "0")
+os.environ.setdefault("TRITON_DISABLE_COMPILE", "1")
+
+_orig_find_spec = _importlib_util.find_spec
+
+
+def _find_spec_no_deepspeed(name, *args, **kwargs):
+    if name == "deepspeed":
+        return None
+    return _orig_find_spec(name, *args, **kwargs)
+
+
+_importlib_util.find_spec = _find_spec_no_deepspeed
+try:
+    from transformers import Qwen2ForCausalLM
+finally:
+    _importlib_util.find_spec = _orig_find_spec
 from torch.nn.utils.rnn import pad_sequence, unpad_sequence
 from cosyvoice.utils.common import IGNORE_ID
 from cosyvoice.transformer.label_smoothing_loss import LabelSmoothingLoss

@@ -72,6 +72,37 @@ class CosyVoiceModel:
         self.hift.load_state_dict(hift_state_dict, strict=True)
         self.hift.to(self.device).eval()
 
+    def enable_cache_dit(self, config: dict | None = None) -> bool:
+        config = config or {}
+        estimator = getattr(self.flow.decoder, "estimator", None)
+        if not isinstance(estimator, torch.nn.Module):
+            print("[cache-dit] estimator is not a torch.nn.Module; skip cache enablement.")
+            return False
+        try:
+            import cache_dit
+            from cache_dit import BlockAdapter, ForwardPattern, DBCacheConfig
+        except Exception as exc:
+            print(f"[cache-dit] import failed; skip cache enablement: {exc}")
+            return False
+
+        cache_config = DBCacheConfig(
+            num_inference_steps=config.get("num_inference_steps", 10),
+            max_warmup_steps=config.get("max_warmup_steps", 8),
+            max_cached_steps=config.get("max_cached_steps", -1),
+            Fn_compute_blocks=config.get("Fn_compute_blocks", 8),
+            Bn_compute_blocks=config.get("Bn_compute_blocks", 0),
+            residual_diff_threshold=config.get("residual_diff_threshold", 0.12),
+            enable_separate_cfg=False,
+        )
+        adapter = BlockAdapter(
+            transformer=estimator,
+            blocks=estimator.transformer_blocks,
+            forward_pattern=ForwardPattern.Pattern_3,
+        )
+        cache_dit.enable_cache(adapter, cache_config=cache_config)
+        print("[cache-dit] DBCache enabled for DiT estimator.")
+        return True
+
     def load_jit(self, llm_text_encoder_model, llm_llm_model, flow_encoder_model):
         llm_text_encoder = torch.jit.load(llm_text_encoder_model, map_location=self.device)
         self.llm.text_encoder = llm_text_encoder

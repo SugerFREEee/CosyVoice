@@ -2,6 +2,15 @@
 # Compare runtime between zero_shot (with prompt audio) and sft (cached speaker) inference paths.
 """
 
+/home/wjs/workspace/miniconda3/envs/dev/bin/python myscripts/compare.py --model-dir /home/wjs/workspace/model/FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
+  --spk-id my_spk4 \
+  --prompt-wav /home/wjs/workspace/CosyVoice/asset/Run_zero_shot.wav \
+  --instruct-text "You are a helpful assistant.<|endofprompt|>" \
+  --prompt-text "祥子找到外祖父定治，却被告知，父亲遭遇了诈骗并造成了168亿日元的损失，已“不再是丰川家的人”。" \
+  --tts-text "祥子决定和父亲一起搬到一间破旧公寓里住。然而父亲酗酒颓废的模样却让祥子感到气愤。家庭的变故使得祥子无心参与乐队的活动" \
+  --stream \
+  --warmup-iters 2
+
 python myscripts/compare.py --model-dir /home/wjs/workspace/model/FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
   --spk-id my_spk4 \
   --prompt-wav /home/wjs/workspace/CosyVoice/asset/Run_zero_shot.wav \
@@ -9,7 +18,15 @@ python myscripts/compare.py --model-dir /home/wjs/workspace/model/FunAudioLLM/Fu
   --prompt-text "祥子找到外祖父定治，却被告知，父亲遭遇了诈骗并造成了168亿日元的损失，已“不再是丰川家的人”。" \
   --tts-text "祥子决定和父亲一起搬到一间破旧公寓里住。然而父亲酗酒颓废的模样却让祥子感到气愤。家庭的变故使得祥子无心参与乐队的活动" \
   --stream \
-  --warmup-iters 0
+  --warmup-iters 2 \
+  --enable-cache-dit \
+  --dbcache-steps 10 \
+  --dbcache-warmup 0 \
+  --dbcache-max-cached -1 \
+  --dbcache-fn 1 \
+  --dbcache-bn 0 \
+  --dbcache-rdt 0.35
+
 
 """
 
@@ -38,7 +55,7 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 def save_wav(prefix, kind, wav, sr):
     path = OUT_DIR / f"{prefix}_{kind}.wav"
-    # torchaudio.save(str(path), wav.cpu(), sr)
+    torchaudio.save(str(path), wav.cpu(), sr)
 
 
 def run_zero_shot(model, tts_text, prompt_text, prompt_wav, stream, save_prefix=None):
@@ -140,9 +157,27 @@ def main():
     )
     parser.add_argument("--stream", action="store_true", help="Enable streaming mode.")
     parser.add_argument("--warmup-iters", type=int, default=1, help="Number of untimed warmup runs per path.")
+    parser.add_argument("--enable-cache-dit", action="store_true", help="Enable cache-dit DBCache for DiT.")
+    parser.add_argument("--dbcache-steps", type=int, default=10, help="DBCache num_inference_steps.")
+    parser.add_argument("--dbcache-warmup", type=int, default=8, help="DBCache max_warmup_steps.")
+    parser.add_argument("--dbcache-max-cached", type=int, default=-1, help="DBCache max_cached_steps.")
+    parser.add_argument("--dbcache-fn", type=int, default=8, help="DBCache Fn_compute_blocks.")
+    parser.add_argument("--dbcache-bn", type=int, default=0, help="DBCache Bn_compute_blocks.")
+    parser.add_argument("--dbcache-rdt", type=float, default=0.12, help="DBCache residual_diff_threshold.")
     args = parser.parse_args()
 
     cosy = AutoModel(model_dir=args.model_dir)
+    if args.enable_cache_dit:
+        cosy.model.enable_cache_dit(
+            {
+                "num_inference_steps": args.dbcache_steps,
+                "max_warmup_steps": args.dbcache_warmup,
+                "max_cached_steps": args.dbcache_max_cached,
+                "Fn_compute_blocks": args.dbcache_fn,
+                "Bn_compute_blocks": args.dbcache_bn,
+                "residual_diff_threshold": args.dbcache_rdt,
+            }
+        )
 
     prompt_text = _with_prefix(args.prompt_text)
     instruct_text = _with_prefix(args.instruct_text)
